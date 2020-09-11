@@ -1,0 +1,23 @@
+Block on Block Computation for GPU Radiation Transfer
+=====================================================
+```
+In the simple GPU radiation transfer model, we have a grid of N^3 cells and need to consider all N^6 cell pair interactions.  We can structure the computation as "block on block".
+
+Divide the N^3 cells into blocks of size M^3.  Call N/M=K, and require K to be an integer for simplicity.  So there will be K^3 blocks.  M^3 should be a multiple of T (threads per kernel), which should be some small multiple of 32.
+
+Launch a grid of K^6 thread blocks.  Each thread block should have T threads.  Each thread block will process one block pair.
+
+Each thread will loop over the M^3 sink cells, mod T.  So thread 0 in a block will do cell 0, T, 2*T, etc, and thread 1 will do 1, T+1, 2*T+1, etc.  For each iteration, all threads will first load one source cell into a shared memory array of length T.   Each thread then will loop over the T sources and apply the source to its sink, accumulating the result into a local scalar variable.  At the end of the source loop, load the next set of T source cells and repeat.  Each thread's scalar accumulation should be saved into global memory at the end of each outer sink loop iteration.
+
+The thread blocks will therefore generate K^3 partial sums for each cell.
+
+This is actually a lot of storage, so in detail, one should probably launch a K^2 grids of K^4 thread blocks.  Each grid will contain all K^3 sink blocks for a pencil of K source blocks.  Therefore, one only needs to allocate space in GPU global memory for M^3*K^4 partial sums.  The host will need to sum the K values per cell into the final value.
+
+What's a reasonable N?  If each interaction is ~20 flops, then N=256 on a 14 TFLOP V100 GPU takes 20*256^6/14e12 = 400 seconds.
+
+Then for N=256, M=32, K=8, T=64, that's 64 kernel launches of 4096 thread blocks, each with 64 threads.  That's about 0.5 GB of partial sums per kernel launch.  Only need one of these arrays per CUDA stream, of which there should be ~three to keep compute and data transfer overlapped.
+
+The cell information probably only needs to be copied over to the GPU once, since the whole thing fits there.  Each kernel launch just needs to know its source pencil since each is treating all sink pencils.  And the pointers to the partial sum array for this stream and the global cell info need to be passed.
+
+What's the flop/byte intensity of this method?  Each time a source gets loaded into shared memory, it's used by T sinks, or 64 in this configuration.  If there's any sink information that needs to be loaded, that will get used M^3 times.  Each partial sink sum that we write global memory has results from M^3 interactions.
+```
