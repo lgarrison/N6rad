@@ -18,4 +18,4 @@ Lehman Garrison
 
 License
 -------
-MIT
+Apache-2.0
