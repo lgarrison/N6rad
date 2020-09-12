@@ -1,15 +1,30 @@
 #include <stdio.h>
+#include <omp.h>
 #include <cuda.h>
 #include <cuda_profiler_api.h>
+#include <chrono>
+#include <assert.h>
+using namespace std::chrono; 
 
 // Problem parameters. Should be templated, or possibly set at runtime.
-#define N 16
-#define M 8
+#define N 256
+#define M 32
 #define K (N/M)
 #define T 64
 #define M3 (M*M*M)
 #define N3 ((int64_t)N*N*N)
 #define K3 (K*K*K)
+
+#define PAIR_OP(sink,source) 2*((2*sink + 1) * (2*source + 1))
+
+/*
+
+TODO
+- Multiple streams
+- Pinned memory
+- Real radiative transfer function
+- Could consider pencil-on-block or pencil-on-pencil if CPU memory is getting out of hand.
+*/
 
 #define cudaCheckErrors(ans) { gpuAssert((ans), __FILE__, __LINE__); }
 inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
@@ -49,7 +64,7 @@ __global__ void block_on_block(FLOAT *cells, FLOAT *partial_sums, int source_pen
             // Each thread loops over all sources
             for(int j = 0; j < T; j++){
                 // A dummy function, just trying to force some floating point math
-                res += 2*((2*thissink + 1) * (2*source_cache[j] + 1));
+                res += PAIR_OP(thissink, source_cache[j]);
             }
             // We change the source cache at the top of the loop; sync here
             __syncthreads();
@@ -62,14 +77,50 @@ __global__ void block_on_block(FLOAT *cells, FLOAT *partial_sums, int source_pen
 
 using FLOAT = float;
 
+void do_cpu(FLOAT *cells, FLOAT *result){
+    #pragma omp parallel for schedule(static)
+    for(int i = 0; i < N3; i++){
+        result[i] = 0;
+        for(int j = 0; j < N3; j++){
+            result[i] += PAIR_OP(cells[i], cells[j]);
+        }
+    }
+}
+
+void check_cpu(FLOAT *cells, FLOAT *gpu_result){
+    FLOAT *cpu_result = new FLOAT[N3];
+    
+    auto start = high_resolution_clock::now(); 
+    do_cpu(cells, cpu_result);
+    auto elapsed = duration_cast<nanoseconds>(high_resolution_clock::now() - start);
+    printf("CPU execution took %.3g seconds\n", elapsed.count()/1e9);
+    
+    for(int i = 0; i < N3; i++){
+        FLOAT rerr = std::abs((cpu_result[i] - gpu_result[i])/cpu_result[i]);
+        if(rerr > 1e-4){
+            printf("Error! cpu_result[%d] = %g, gpu_result[%d] = %g, rerr = %g\n", i, cpu_result[i], i, gpu_result[i], rerr);
+            break;
+        }
+        
+        if(i == N3-1)
+            printf("GPU result matches CPU result!\n");
+    }
+    
+    delete[] cpu_result;
+}
+
 // Host driver
 int main(int argc, char **argv){
+    // check params
+    assert(M*K == N);
+    assert((M3/T)*T == M3);
+    assert((T/32)*32 == T);
 
     // Allocate and fill the cells
     FLOAT *cells = new FLOAT[N3];
     FLOAT *result = new FLOAT[N3];
     for(int64_t i = 0; i < N3; i++){
-        cells[i] = 1.;
+        cells[i] = ((double) rand()) / RAND_MAX;
         result[i] = 0;
     }
     
@@ -102,6 +153,8 @@ int main(int argc, char **argv){
     cudaProfilerStop();
     
     // Now sum the K^3 results per cell
+    auto start = high_resolution_clock::now(); 
+    #pragma omp parallel for schedule(static)
     for(int64_t i = 0; i < N3; i++){
         for(int64_t j = 0; j < K*K; j++){
             for(int64_t kk = 0; kk < K; kk++){
@@ -110,18 +163,24 @@ int main(int argc, char **argv){
             }
         }
     }
+    auto elapsed = duration_cast<nanoseconds>(high_resolution_clock::now() - start);
+    printf("Reduction took %.3g seconds\n", elapsed.count()/1e9);
     
-    // Verify result
-    printf("result[0] = %g\n", result[0]);
-    int i = 0;
-    for(i = 0; i < N3; i++){
+    // Anything much bigger than this is unlikely to complete on the CPU in a useful amount of time
+    if(N <= 64)
+        check_cpu(cells, result);
+    
+    // Verify result, only useful if the cells are filled with a constant
+    /*printf("result[0] = %g\n", result[0]);
+    for(int i = 0; i < N3; i++){
         if (result[i] != 18.*N3){
             printf("result[%d] = %g\n", i, result[i]);
             break;
         }
+        if(i == N3-1)
+            printf("Verified!\n");
     }
-    if(i == N3)
-        printf("Verified!\n");
+    */
     
     cudaCheckErrors(cudaFree(dev_cells));
     cudaCheckErrors(cudaFree(dev_partial_sums));
