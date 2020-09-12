@@ -15,8 +15,6 @@ using namespace std::chrono;
 #define N3 ((int64_t)N*N*N)
 #define K3 (K*K*K)
 
-#define PAIR_OP(sink,source) 2*((2*sink + 1) * (2*source + 1))
-
 /*
 
 TODO
@@ -34,6 +32,11 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
       fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
       if (abort) exit(code);
    }
+}
+
+template<typename FLOAT>
+__host__ __device__ inline FLOAT pair_op(FLOAT sink, FLOAT source){
+    return 2*((2*sink + 1) * (2*source + 1));
 }
 
 // Apply one source pencil to all sinks
@@ -64,7 +67,7 @@ __global__ void block_on_block(FLOAT *cells, FLOAT *partial_sums, int source_pen
             // Each thread loops over all sources
             for(int j = 0; j < T; j++){
                 // A dummy function, just trying to force some floating point math
-                res += PAIR_OP(thissink, source_cache[j]);
+                res += pair_op(thissink, source_cache[j]);
             }
             // We change the source cache at the top of the loop; sync here
             __syncthreads();
@@ -82,7 +85,7 @@ void do_cpu(FLOAT *cells, FLOAT *result){
     for(int i = 0; i < N3; i++){
         result[i] = 0;
         for(int j = 0; j < N3; j++){
-            result[i] += PAIR_OP(cells[i], cells[j]);
+            result[i] += pair_op(cells[i], cells[j]);
         }
     }
 }
@@ -130,6 +133,7 @@ int main(int argc, char **argv){
     }
     
     cudaProfilerStart();
+    auto start = high_resolution_clock::now();
     
     // the device-side arrays
     FLOAT *dev_cells, *dev_partial_sums;
@@ -150,10 +154,13 @@ int main(int argc, char **argv){
         cudaCheckErrors(cudaDeviceSynchronize());
     }
     
+    auto elapsed = duration_cast<nanoseconds>(high_resolution_clock::now() - start);
+    printf("GPU took %.3g seconds for N=%d, M=%d\n", elapsed.count()/1e9, N, M);
+    
     cudaProfilerStop();
     
     // Now sum the K^3 results per cell
-    auto start = high_resolution_clock::now(); 
+    start = high_resolution_clock::now();
     #pragma omp parallel for schedule(static)
     for(int64_t i = 0; i < N3; i++){
         for(int64_t j = 0; j < K*K; j++){
@@ -163,7 +170,7 @@ int main(int argc, char **argv){
             }
         }
     }
-    auto elapsed = duration_cast<nanoseconds>(high_resolution_clock::now() - start);
+    elapsed = duration_cast<nanoseconds>(high_resolution_clock::now() - start);
     printf("Reduction took %.3g seconds\n", elapsed.count()/1e9);
     
     // Anything much bigger than this is unlikely to complete on the CPU in a useful amount of time
