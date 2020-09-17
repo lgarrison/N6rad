@@ -39,6 +39,14 @@ __host__ __device__ inline FLOAT pair_op(FLOAT sink, FLOAT source){
     return 2*((2*sink + 1) * (2*source + 1));
 }
 
+// Take 1D index i
+// and convert it to the corresponding 3D (ix,iy,iz) index
+__host__ __device__ inline void unravel_index(int i, int dim, int &ix, int &iy, int &iz){
+    ix = i / (dim*dim);
+    iy = i / dim - ix*dim;
+    iz = i % dim;
+}
+
 // Apply one source pencil to all sinks
 // Cells should probably already be in block order, i.e. (X,Y,Z,x,y,z)
 template<typename FLOAT>
@@ -47,6 +55,12 @@ __global__ void block_on_block(FLOAT *cells, FLOAT *partial_sums, int source_pen
     int sinkblock = blockIdx.x;  // global 1D block index
     int sourcez = blockIdx.y;    // z offset of source block in source pencil
     int sourceblock = source_pencil*K + sourcez;  // global 1D
+    
+    // Get the (i,j,k) index of the sink and source block in the unpermuted N^3 grid
+    int _sinki, _sinkj, _sinkk;
+    int _sourcei, _sourcej, _sourcek;
+    unravel_index(sinkblock, K, _sinki, _sinkj, _sinkk);
+    unravel_index(sourceblock, K, _sourcei, _sourcej, _sourcek);
     
     FLOAT *sinks = cells + M3*sinkblock;
     FLOAT *sources = cells + M3*sourceblock;
@@ -58,6 +72,15 @@ __global__ void block_on_block(FLOAT *cells, FLOAT *partial_sums, int source_pen
         FLOAT thissink = sinks[i];
         FLOAT res = 0;
         
+        // Get the location within the block
+        int sinki, sinkj, sinkk;
+        unravel_index(i, M, sinki, sinkj, sinkk);
+        
+        // and add on the coordinates of the block
+        sinki += _sinki;
+        sinkj += _sinkj;
+        sinkk += _sinkk;
+        
         // Source loop
         for(int j = tid; j < M3; j += T){
             // Each thread loads one source
@@ -65,9 +88,23 @@ __global__ void block_on_block(FLOAT *cells, FLOAT *partial_sums, int source_pen
             __syncthreads();
 
             // Each thread loops over all sources
-            for(int j = 0; j < T; j++){
+            for(int t = 0; t < T; t++){
+                // TODO: there's a few options to optimize this indexing math
+                // - get rid of mod
+                // - if T divides M^2, only have to update j,k
+                // - can precompute index(es) into shared array
+                
+                // Get the location within the block
+                int sourcei, sourcej, sourcek;
+                unravel_index(i, M, sourcei, sourcej, sourcek);
+
+                // and add on the coordinates of the block
+                sourcei += _sourcei;
+                sourcej += _sourcej;
+                sourcek += _sourcek;
+                
                 // A dummy function, just trying to force some floating point math
-                res += pair_op(thissink, source_cache[j]);
+                res += pair_op(thissink, source_cache[t]);
             }
             // We change the source cache at the top of the loop; sync here
             __syncthreads();
