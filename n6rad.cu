@@ -8,8 +8,8 @@ using namespace std::chrono;
 
 // Problem parameters
 // TODO: Set at runtime (check performance)
-#define N 128
-#define M 16
+#define N 256
+#define M 32
 #define K (N/M)
 #define T 64
 #define M3 (M*M*M)
@@ -37,7 +37,8 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 
 template<typename FLOAT>
 __host__ __device__ inline FLOAT pair_op(FLOAT sink, FLOAT source, int dist2){
-    return 2*((2*sink + 1) * (2*source + 1)) + static_cast<FLOAT>(dist2);
+    // faster to multiply by (1/r^2) than divide by r^2
+    return 2*((2*sink + 1) * (2*source + 1))*(1/static_cast<FLOAT>(dist2));
 }
 
 // Take 1D index i
@@ -99,6 +100,7 @@ __global__ void block_on_block(FLOAT *cells, FLOAT *partial_sums, int source_pen
                 // - get rid of mod
                 // - if T divides M^2, only have to update j,k
                 // - can precompute index(es) into shared array
+                // - could use bit shifts, but probably don't want to constrain to power of 2
                 
                 // Get the location within the block
                 int sourcei, sourcej, sourcek;
