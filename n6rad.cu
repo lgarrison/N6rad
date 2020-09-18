@@ -6,9 +6,10 @@
 #include <assert.h>
 using namespace std::chrono; 
 
-// Problem parameters. Should be templated, or possibly set at runtime.
-#define N 256
-#define M 32
+// Problem parameters
+// TODO: Set at runtime (check performance)
+#define N 128
+#define M 16
 #define K (N/M)
 #define T 64
 #define M3 (M*M*M)
@@ -35,20 +36,25 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 }
 
 template<typename FLOAT>
-__host__ __device__ inline FLOAT pair_op(FLOAT sink, FLOAT source){
-    return 2*((2*sink + 1) * (2*source + 1));
+__host__ __device__ inline FLOAT pair_op(FLOAT sink, FLOAT source, int dist2){
+    return 2*((2*sink + 1) * (2*source + 1)) + static_cast<FLOAT>(dist2);
 }
 
 // Take 1D index i
 // and convert it to the corresponding 3D (ix,iy,iz) index
-__host__ __device__ inline void unravel_index(int i, int dim, int &ix, int &iy, int &iz){
+// expand lets you multiply the final result by some factor (useful for converting block indices to cell indices)
+__host__ __device__ inline void unravel_index(int i, int dim, int &ix, int &iy, int &iz, int expand=1){
     ix = i / (dim*dim);
     iy = i / dim - ix*dim;
     iz = i % dim;
+    
+    ix *= expand;
+    iy *= expand;
+    iz *= expand;
 }
 
-// Apply one source pencil to all sinks
-// Cells should probably already be in block order, i.e. (X,Y,Z,x,y,z)
+// Apply one source block to one sink block
+// Cells must be in block order, i.e. (X,Y,Z,x,y,z)
 template<typename FLOAT>
 __global__ void block_on_block(FLOAT *cells, FLOAT *partial_sums, int source_pencil){
     int tid = threadIdx.x;
@@ -59,8 +65,8 @@ __global__ void block_on_block(FLOAT *cells, FLOAT *partial_sums, int source_pen
     // Get the (i,j,k) index of the sink and source block in the unpermuted N^3 grid
     int _sinki, _sinkj, _sinkk;
     int _sourcei, _sourcej, _sourcek;
-    unravel_index(sinkblock, K, _sinki, _sinkj, _sinkk);
-    unravel_index(sourceblock, K, _sourcei, _sourcej, _sourcek);
+    unravel_index(sinkblock, K, _sinki, _sinkj, _sinkk, M);
+    unravel_index(sourceblock, K, _sourcei, _sourcej, _sourcek, M);
     
     FLOAT *sinks = cells + M3*sinkblock;
     FLOAT *sources = cells + M3*sourceblock;
@@ -82,9 +88,9 @@ __global__ void block_on_block(FLOAT *cells, FLOAT *partial_sums, int source_pen
         sinkk += _sinkk;
         
         // Source loop
-        for(int j = tid; j < M3; j += T){
+        for(int j = 0; j < M3; j += T){
             // Each thread loads one source
-            source_cache[tid] = sources[j];
+            source_cache[tid] = sources[j+tid];
             __syncthreads();
 
             // Each thread loops over all sources
@@ -96,15 +102,17 @@ __global__ void block_on_block(FLOAT *cells, FLOAT *partial_sums, int source_pen
                 
                 // Get the location within the block
                 int sourcei, sourcej, sourcek;
-                unravel_index(i, M, sourcei, sourcej, sourcek);
+                unravel_index(j+t, M, sourcei, sourcej, sourcek);
 
                 // and add on the coordinates of the block
                 sourcei += _sourcei;
                 sourcej += _sourcej;
                 sourcek += _sourcek;
                 
+                int dist2 = (sinki - sourcei)*(sinki - sourcei) + (sinkj - sourcej)*(sinkj - sourcej) + (sinkk - sourcek)*(sinkk - sourcek);
+                
                 // A dummy function, just trying to force some floating point math
-                res += pair_op(thissink, source_cache[t]);
+                res += pair_op(thissink, source_cache[t], dist2);
             }
             // We change the source cache at the top of the loop; sync here
             __syncthreads();
@@ -118,11 +126,48 @@ __global__ void block_on_block(FLOAT *cells, FLOAT *partial_sums, int source_pen
 using FLOAT = float;
 
 void do_cpu(FLOAT *cells, FLOAT *result){
+    // Do the same calculation on the GPU
+    // We'll assume the cells are not permuted into blocks; i.e. standard C row-major order
+    // This will provide some insurance against repeated indexing errors
+    
     #pragma omp parallel for schedule(static)
     for(int i = 0; i < N3; i++){
         result[i] = 0;
+        int ix, iy, iz;
+        unravel_index(i, N, ix, iy, iz);
         for(int j = 0; j < N3; j++){
-            result[i] += pair_op(cells[i], cells[j]);
+            int jx, jy, jz;
+            unravel_index(j, N, jx, jy, jz);
+            int dist2 = (ix - jx)*(ix - jx) + (iy - jy)*(iy - jy) + (iz - jz)*(iz - jz);
+            result[i] += pair_op(cells[i], cells[j], dist2);
+        }
+    }
+}
+
+// The cells are laid out so that individual blocks are physically contiguous for the GPU
+// Unpermute them into standard C order
+void unpermute_cells(FLOAT *unpermuted_cells, FLOAT *cells){
+    #pragma omp parallel for schedule(static)
+    for(int i = 0; i < N; i++){
+        int ki = i / M;
+        int mi = i % M;
+        
+        for(int j = 0; j < N; j++){
+            int kj = j / M;
+            int mj = j % M;
+            
+            for(int k = 0; k < N; k++){
+                int kk = k / M;
+                int mk = k % M;
+                
+                int bstart = (ki*K*K + kj*K + kk)*M3;
+                int off = mi*M*M + mj*M + mk;
+                int pi = bstart + off;
+        
+                int to = i*N*N + j*N + k;
+                
+                unpermuted_cells[to] = cells[pi];
+            }
         }
     }
 }
@@ -130,15 +175,23 @@ void do_cpu(FLOAT *cells, FLOAT *result){
 void check_cpu(FLOAT *cells, FLOAT *gpu_result){
     FLOAT *cpu_result = new FLOAT[N3];
     
+    // Make an unpermuted version for the CPU to operate on
+    FLOAT *unpermuted_cells = new FLOAT[N3];
+    unpermute_cells(unpermuted_cells, cells);
+    
     auto start = high_resolution_clock::now(); 
-    do_cpu(cells, cpu_result);
+    do_cpu(unpermuted_cells, cpu_result);
     auto elapsed = duration_cast<nanoseconds>(high_resolution_clock::now() - start);
     printf("CPU execution took %.3g seconds\n", elapsed.count()/1e9);
     
+    // Reorder the GPU result into the order that the CPU produces
+    FLOAT *unpermuted_gpu_result = new FLOAT[N3];
+    unpermute_cells(unpermuted_gpu_result, gpu_result);
+    
     for(int i = 0; i < N3; i++){
-        FLOAT rerr = std::abs((cpu_result[i] - gpu_result[i])/cpu_result[i]);
+        FLOAT rerr = std::abs((cpu_result[i] - unpermuted_gpu_result[i])/cpu_result[i]);
         if(rerr > 1e-4){
-            printf("Error! cpu_result[%d] = %g, gpu_result[%d] = %g, rerr = %g\n", i, cpu_result[i], i, gpu_result[i], rerr);
+            printf("Error! cpu_result[%d] = %g, gpu_result[%d] = %g, rerr = %g\n", i, cpu_result[i], i, unpermuted_gpu_result[i], rerr);
             break;
         }
         
@@ -146,6 +199,8 @@ void check_cpu(FLOAT *cells, FLOAT *gpu_result){
             printf("GPU result matches CPU result!\n");
     }
     
+    delete[] unpermuted_cells;
+    delete[] unpermuted_gpu_result;
     delete[] cpu_result;
 }
 
@@ -202,7 +257,6 @@ int main(int argc, char **argv){
     for(int64_t i = 0; i < N3; i++){
         for(int64_t j = 0; j < K*K; j++){
             for(int64_t kk = 0; kk < K; kk++){
-                //printf("partials[j][kk*N3 + i] = %g\n", partials[j][kk*N3 + i]);
                 result[i] += partials[j][kk*N3 + i];
             }
         }

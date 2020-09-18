@@ -2,7 +2,7 @@ TARGETS := n6rad
 NVCC := nvcc
 
 n6rad: n6rad.cu
-	$(NVCC) -O3 -g -arch=sm_75 -Xcompiler "-fopenmp" --ptxas-options=-v -o $@ $<
+	$(NVCC) -O3 -g -arch=sm_75 -Xcompiler "-fopenmp -Wall" --ptxas-options=-v -o $@ $<
 
 clean:
 	$(RM) $(TARGETS)
